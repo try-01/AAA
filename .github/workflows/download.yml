@@ -8,8 +8,10 @@ on:
         required: true
         type: string
         default: 'https://domain.com/contoh_file.tgz'
-      search_pattern:
-        description: 'Pola Wildcard (contoh: *.txt, *boot*, *meta/*.xml)'
+      search_patterns:
+        description: |
+          Pola file, pisahkan dengan koma.
+          Contoh: *.img, bootloader.bin, *boot*, images/*.xml, system/build.prop
         required: true
         type: string
         default: '*.img'
@@ -45,19 +47,14 @@ jobs:
         run: |
           ARCHIVE_NAME="downloaded_archive.${{ inputs.archive_format }}"
           echo "Mengunduh file besar secara paralel (16 koneksi)..."
-          
-          # aria2c memecah file menjadi 16 koneksi agar kecepatan download maksimal
           aria2c --max-connection-per-server=16 --split=16 --min-split-size=1M --continue=true --out="$ARCHIVE_NAME" "${{ inputs.file_url }}"
-          
           echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> $GITHUB_ENV
 
       - name: 3. Baca Struktur File (Kecepatan Tinggi)
         run: |
           echo "Membaca struktur file secara efisien..."
-          
           case "${{ inputs.unpack_tool }}" in
             tar)
-              # Jika format adalah tgz / tar.gz, gunakan pigz untuk mempercepat pembacaan
               if [[ "${{ inputs.archive_format }}" == "tgz" || "${{ inputs.archive_format }}" == "tar.gz" ]]; then
                 tar -I pigz -tf "${{ env.ARCHIVE_NAME }}" > daftar_struktur.txt
               else
@@ -68,33 +65,68 @@ jobs:
               unzip -Z1 "${{ env.ARCHIVE_NAME }}" > daftar_struktur.txt
               ;;
             7z)
-              # -mmt=on mengaktifkan Multi-Threading
               7z l -ba -slt -mmt=on "${{ env.ARCHIVE_NAME }}" | grep "^Path = " | sed 's/^Path = //' > daftar_struktur.txt
               ;;
           esac
 
-      - name: 4. Ekstrak Cepat Berdasarkan Pola (Wildcard)
+      - name: 4. Ekstrak Cepat Berdasarkan Beberapa Pola
         run: |
           mkdir -p hasil_ekstrak
-          echo "Mengekstrak '${{ inputs.search_pattern }}' secepat mungkin..."
-          
-          case "${{ inputs.unpack_tool }}" in
-            tar)
-              if [[ "${{ inputs.archive_format }}" == "tgz" || "${{ inputs.archive_format }}" == "tar.gz" ]]; then
-                tar -I pigz -xf "${{ env.ARCHIVE_NAME }}" --wildcards "${{ inputs.search_pattern }}" -C hasil_ekstrak/
-              else
-                tar -xf "${{ env.ARCHIVE_NAME }}" --wildcards "${{ inputs.search_pattern }}" -C hasil_ekstrak/
-              fi
-              ;;
-            unzip)
-              # Unzip standar sudah cukup I/O efisien, namun kita nonaktifkan output ke layar (-q) agar tidak membebani log dan RAM
-              unzip -q "${{ env.ARCHIVE_NAME }}" "${{ inputs.search_pattern }}" -d hasil_ekstrak/
-              ;;
-            7z)
-              # -mmt=on untuk menggunakan semua core CPU saat ekstrak
-              7z x -mmt=on "${{ env.ARCHIVE_NAME }}" "${{ inputs.search_pattern }}" -ohasil_ekstrak/ -r
-              ;;
-          esac
+
+          # ─── Parse input: pisahkan koma, buang spasi di awal/akhir tiap pola ───
+          IFS=',' read -ra RAW_PATTERNS <<< "${{ inputs.search_patterns }}"
+          PATTERNS=()
+          for p in "${RAW_PATTERNS[@]}"; do
+            trimmed="$(echo "$p" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            [[ -n "$trimmed" ]] && PATTERNS+=("$trimmed")
+          done
+
+          echo "Jumlah pola yang akan diekstrak: ${#PATTERNS[@]}"
+          for p in "${PATTERNS[@]}"; do echo "  → $p"; done
+
+          # ─── Ekstrak per pola ───────────────────────────────────────────────
+          FAILED=0
+          for PATTERN in "${PATTERNS[@]}"; do
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "Mengekstrak pola: '$PATTERN'"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+            case "${{ inputs.unpack_tool }}" in
+              tar)
+                if [[ "${{ inputs.archive_format }}" == "tgz" || "${{ inputs.archive_format }}" == "tar.gz" ]]; then
+                  tar -I pigz -xf "${{ env.ARCHIVE_NAME }}" -C hasil_ekstrak/ \
+                      --wildcards --no-anchored "$PATTERN" || \
+                    { echo "⚠ Tidak ada file cocok untuk: $PATTERN"; FAILED=$((FAILED+1)); }
+                else
+                  tar -xf "${{ env.ARCHIVE_NAME }}" -C hasil_ekstrak/ \
+                      --wildcards --no-anchored "$PATTERN" || \
+                    { echo "⚠ Tidak ada file cocok untuk: $PATTERN"; FAILED=$((FAILED+1)); }
+                fi
+                ;;
+              unzip)
+                unzip -q "${{ env.ARCHIVE_NAME }}" "$PATTERN" -d hasil_ekstrak/ || \
+                  { echo "⚠ Tidak ada file cocok untuk: $PATTERN"; FAILED=$((FAILED+1)); }
+                ;;
+              7z)
+                7z x -mmt=on "${{ env.ARCHIVE_NAME }}" "$PATTERN" -ohasil_ekstrak/ -r || \
+                  { echo "⚠ Tidak ada file cocok untuk: $PATTERN"; FAILED=$((FAILED+1)); }
+                ;;
+            esac
+          done
+
+          # ─── Ringkasan ───────────────────────────────────────────────────────
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          TOTAL=${#PATTERNS[@]}
+          SUCCESS=$((TOTAL - FAILED))
+          echo "Selesai: $SUCCESS/$TOTAL pola berhasil diekstrak."
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          # Tampilkan hasil akhir
+          echo ""
+          echo "File yang berhasil diekstrak:"
+          find hasil_ekstrak/ -type f | sort
 
       - name: 5. Upload Artefak Struktur File (.txt)
         uses: actions/upload-artifact@v4
