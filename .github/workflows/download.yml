@@ -1,0 +1,116 @@
+name: Ultra-Fast Extractor with Parallel Processing
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_url:
+        description: 'Tautan langsung file kompresi'
+        required: true
+        type: string
+        default: 'https://domain.com/contoh_file.tgz'
+      search_pattern:
+        description: 'Pola Wildcard (contoh: *.txt, *boot*, *meta/*.xml)'
+        required: true
+        type: string
+        default: '*.img'
+      archive_format:
+        description: 'Format file (contoh: tgz, zip, 7z, tar.gz)'
+        required: true
+        type: string
+        default: 'tgz'
+      unpack_tool:
+        description: 'Paket aplikasi (Pilih sesuai format)'
+        required: true
+        type: choice
+        options:
+          - tar    # Gunakan untuk .tar, .tgz, .tar.gz (Didukung pigz)
+          - unzip  # Gunakan untuk .zip murni
+          - 7z     # Gunakan untuk .7z, .rar, atau multi-format
+
+jobs:
+  fast-extract-upload:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 1. Pasang Alat Pendongkrak Kecepatan
+        run: |
+          echo "Menginstal aria2c (Parallel Downloader) dan pigz (Parallel GZIP)..."
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip p7zip-full aria2 pigz
+
+      - name: 2. Unduh Paralel dengan Aria2c
+        run: |
+          ARCHIVE_NAME="downloaded_archive.${{ inputs.archive_format }}"
+          echo "Mengunduh file besar secara paralel (16 koneksi)..."
+          
+          # aria2c memecah file menjadi 16 koneksi agar kecepatan download maksimal
+          aria2c --max-connection-per-server=16 --split=16 --min-split-size=1M --continue=true --out="$ARCHIVE_NAME" "${{ inputs.file_url }}"
+          
+          echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> $GITHUB_ENV
+
+      - name: 3. Baca Struktur File (Kecepatan Tinggi)
+        run: |
+          echo "Membaca struktur file secara efisien..."
+          
+          case "${{ inputs.unpack_tool }}" in
+            tar)
+              # Jika format adalah tgz / tar.gz, gunakan pigz untuk mempercepat pembacaan
+              if [[ "${{ inputs.archive_format }}" == "tgz" || "${{ inputs.archive_format }}" == "tar.gz" ]]; then
+                tar -I pigz -tf "${{ env.ARCHIVE_NAME }}" > daftar_struktur.txt
+              else
+                tar -tf "${{ env.ARCHIVE_NAME }}" > daftar_struktur.txt
+              fi
+              ;;
+            unzip)
+              unzip -Z1 "${{ env.ARCHIVE_NAME }}" > daftar_struktur.txt
+              ;;
+            7z)
+              # -mmt=on mengaktifkan Multi-Threading
+              7z l -ba -slt -mmt=on "${{ env.ARCHIVE_NAME }}" | grep "^Path = " | sed 's/^Path = //' > daftar_struktur.txt
+              ;;
+          esac
+
+      - name: 4. Ekstrak Cepat Berdasarkan Pola (Wildcard)
+        run: |
+          mkdir -p hasil_ekstrak
+          echo "Mengekstrak '${{ inputs.search_pattern }}' secepat mungkin..."
+          
+          case "${{ inputs.unpack_tool }}" in
+            tar)
+              if [[ "${{ inputs.archive_format }}" == "tgz" || "${{ inputs.archive_format }}" == "tar.gz" ]]; then
+                tar -I pigz -xf "${{ env.ARCHIVE_NAME }}" --wildcards "${{ inputs.search_pattern }}" -C hasil_ekstrak/
+              else
+                tar -xf "${{ env.ARCHIVE_NAME }}" --wildcards "${{ inputs.search_pattern }}" -C hasil_ekstrak/
+              fi
+              ;;
+            unzip)
+              # Unzip standar sudah cukup I/O efisien, namun kita nonaktifkan output ke layar (-q) agar tidak membebani log dan RAM
+              unzip -q "${{ env.ARCHIVE_NAME }}" "${{ inputs.search_pattern }}" -d hasil_ekstrak/
+              ;;
+            7z)
+              # -mmt=on untuk menggunakan semua core CPU saat ekstrak
+              7z x -mmt=on "${{ env.ARCHIVE_NAME }}" "${{ inputs.search_pattern }}" -ohasil_ekstrak/ -r
+              ;;
+          esac
+
+      - name: 5. Upload Artefak Struktur File (.txt)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: struktur-${{ inputs.archive_format }}-txt
+          path: daftar_struktur.txt
+          retention-days: 7
+
+      - name: 6. Upload Artefak Hasil (Zipped by GitHub)
+        uses: actions/upload-artifact@v4
+        with:
+          name: fast-ekstrak-hasil
+          path: hasil_ekstrak/
+          retention-days: 7
+
+      - name: 7. Bersihkan File Besar
+        if: always()
+        run: rm -f "${{ env.ARCHIVE_NAME }}"
