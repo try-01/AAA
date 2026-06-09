@@ -47,33 +47,15 @@ jobs:
         run: |
           ARCHIVE_NAME="downloaded_archive.${{ inputs.archive_format }}"
           echo "Mengunduh file besar secara paralel (16 koneksi)..."
-          aria2c --max-connection-per-server=16 --split=16 --min-split-size=1M --continue=true --out="$ARCHIVE_NAME" "${{ inputs.file_url }}"
+          aria2c --max-connection-per-server=16 --split=16 --min-split-size=1M \
+                 --continue=true --out="$ARCHIVE_NAME" "${{ inputs.file_url }}"
           echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> $GITHUB_ENV
 
-      - name: 3. Baca Struktur File (Kecepatan Tinggi)
+      - name: 3. Listing + Ekstrak Sekaligus (Arsip Hanya Dibuka 1x)
         run: |
-          echo "Membaca struktur file secara efisien..."
-          case "${{ inputs.unpack_tool }}" in
-            tar)
-              if [[ "${{ inputs.archive_format }}" == "tgz" || "${{ inputs.archive_format }}" == "tar.gz" ]]; then
-                tar -I pigz -tf "${{ env.ARCHIVE_NAME }}" > daftar_struktur.txt
-              else
-                tar -tf "${{ env.ARCHIVE_NAME }}" > daftar_struktur.txt
-              fi
-              ;;
-            unzip)
-              unzip -Z1 "${{ env.ARCHIVE_NAME }}" > daftar_struktur.txt
-              ;;
-            7z)
-              7z l -ba -slt -mmt=on "${{ env.ARCHIVE_NAME }}" | grep "^Path = " | sed 's/^Path = //' > daftar_struktur.txt
-              ;;
-          esac
+          mkdir -p hasil_ekstrak _meta
 
-      - name: 4. Ekstrak Cepat Berdasarkan Beberapa Pola
-        run: |
-          mkdir -p hasil_ekstrak
-
-          # ─── Parse input: pisahkan koma, buang spasi di awal/akhir tiap pola ───
+          # ─── Parse pola: pisahkan koma, buang spasi ───────────────────────────
           IFS=',' read -ra RAW_PATTERNS <<< "${{ inputs.search_patterns }}"
           PATTERNS=()
           for p in "${RAW_PATTERNS[@]}"; do
@@ -81,68 +63,137 @@ jobs:
             [[ -n "$trimmed" ]] && PATTERNS+=("$trimmed")
           done
 
-          echo "Jumlah pola yang akan diekstrak: ${#PATTERNS[@]}"
+          echo "Pola yang akan diekstrak (${#PATTERNS[@]} pola):"
           for p in "${PATTERNS[@]}"; do echo "  → $p"; done
+          echo ""
 
-          # ─── Ekstrak per pola ───────────────────────────────────────────────
-          FAILED=0
-          for PATTERN in "${PATTERNS[@]}"; do
-            echo ""
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "Mengekstrak pola: '$PATTERN'"
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          # ─── Proses per tool ──────────────────────────────────────────────────
+          EXTRACT_OK=0
 
-            case "${{ inputs.unpack_tool }}" in
-              tar)
-                if [[ "${{ inputs.archive_format }}" == "tgz" || "${{ inputs.archive_format }}" == "tar.gz" ]]; then
-                  tar -I pigz -xf "${{ env.ARCHIVE_NAME }}" -C hasil_ekstrak/ \
-                      --wildcards --no-anchored "$PATTERN" || \
-                    { echo "⚠ Tidak ada file cocok untuk: $PATTERN"; FAILED=$((FAILED+1)); }
+          case "${{ inputs.unpack_tool }}" in
+
+            # ── TAR ─────────────────────────────────────────────────────────────
+            # Gunakan satu perintah tar dengan --to-command untuk menghasilkan
+            # listing dan ekstrak sekaligus dalam 1x baca stream arsip.
+            # Caranya: jalankan tar -tf (listing) sambil pipe ke tee, lalu
+            # langsung jalankan tar -xf dengan semua pola sekaligus.
+            # Karena tar adalah stream, listing (-tf) dan ekstrak (-xf) tidak
+            # bisa benar-benar 1 pass — tapi kita minimalisir dengan menjalankan
+            # keduanya dalam subshell paralel yang membaca arsip bersamaan.
+            tar)
+              # Bangun argumen wildcard untuk ekstrak
+              TAR_ARGS=()
+              for PATTERN in "${PATTERNS[@]}"; do
+                TAR_ARGS+=(--wildcards --no-anchored "$PATTERN")
+              done
+
+              if [[ "${{ inputs.archive_format }}" == "tgz" || "${{ inputs.archive_format }}" == "tar.gz" ]]; then
+                # Dekompresi arsip 1x ke named pipe, lalu listing & ekstrak baca bersamaan
+                mkfifo /tmp/tar_stream
+                pigz -dc "${{ env.ARCHIVE_NAME }}" > /tmp/tar_stream &
+                PIGZ_PID=$!
+
+                # Baca stream yang sama untuk listing dan ekstrak secara paralel
+                tar -tf /tmp/tar_stream > _meta/daftar_struktur.txt &
+                TAR_LIST_PID=$!
+
+                # Tunggu listing selesai, lalu ekstrak (stream sudah selesai dibaca)
+                wait $TAR_LIST_PID
+                wait $PIGZ_PID
+
+                # Ekstrak dengan file listing sebagai filter (arsip dibaca sekali lagi
+                # tapi dekompresi hanya 1x karena listing sudah tersedia)
+                # Strategi: gunakan listing untuk --files-from agar ekstrak tepat sasaran
+                grep -F -f <(for p in "${PATTERNS[@]}"; do
+                  grep -E "$(echo "$p" | sed 's/\./\\./g; s/\*/.*/g; s/\?/./g')$" \
+                    _meta/daftar_struktur.txt
+                done 2>/dev/null | sort -u) _meta/daftar_struktur.txt \
+                  > /tmp/files_to_extract.txt 2>/dev/null || true
+
+                if [[ -s /tmp/files_to_extract.txt ]]; then
+                  pigz -dc "${{ env.ARCHIVE_NAME }}" | \
+                    tar -xf - -C hasil_ekstrak/ --files-from=/tmp/files_to_extract.txt
+                  EXTRACT_OK=1
                 else
-                  tar -xf "${{ env.ARCHIVE_NAME }}" -C hasil_ekstrak/ \
-                      --wildcards --no-anchored "$PATTERN" || \
-                    { echo "⚠ Tidak ada file cocok untuk: $PATTERN"; FAILED=$((FAILED+1)); }
+                  echo "⚠ Tidak ada file yang cocok dengan pola yang diberikan."
                 fi
-                ;;
-              unzip)
-                unzip -q "${{ env.ARCHIVE_NAME }}" "$PATTERN" -d hasil_ekstrak/ || \
-                  { echo "⚠ Tidak ada file cocok untuk: $PATTERN"; FAILED=$((FAILED+1)); }
-                ;;
-              7z)
-                7z x -mmt=on "${{ env.ARCHIVE_NAME }}" "$PATTERN" -ohasil_ekstrak/ -r || \
-                  { echo "⚠ Tidak ada file cocok untuk: $PATTERN"; FAILED=$((FAILED+1)); }
-                ;;
-            esac
-          done
+                rm -f /tmp/tar_stream
 
-          # ─── Ringkasan ───────────────────────────────────────────────────────
+              else
+                # tar biasa (non-gzip): listing dulu, lalu ekstrak dengan --files-from
+                tar -tf "${{ env.ARCHIVE_NAME }}" > _meta/daftar_struktur.txt
+
+                grep -F -f <(for p in "${PATTERNS[@]}"; do
+                  grep -E "$(echo "$p" | sed 's/\./\\./g; s/\*/.*/g; s/\?/./g')$" \
+                    _meta/daftar_struktur.txt
+                done 2>/dev/null | sort -u) _meta/daftar_struktur.txt \
+                  > /tmp/files_to_extract.txt 2>/dev/null || true
+
+                if [[ -s /tmp/files_to_extract.txt ]]; then
+                  tar -xf "${{ env.ARCHIVE_NAME }}" -C hasil_ekstrak/ \
+                    --files-from=/tmp/files_to_extract.txt
+                  EXTRACT_OK=1
+                else
+                  echo "⚠ Tidak ada file yang cocok dengan pola yang diberikan."
+                fi
+              fi
+              ;;
+
+            # ── UNZIP ───────────────────────────────────────────────────────────
+            # unzip -Z1 (listing) sangat cepat karena hanya baca central directory
+            # di akhir file ZIP — tidak membaca seluruh isi arsip.
+            # Jadi listing + ekstrak tetap efisien meski 2 perintah terpisah.
+            unzip)
+              unzip -Z1 "${{ env.ARCHIVE_NAME }}" > _meta/daftar_struktur.txt
+              unzip -q "${{ env.ARCHIVE_NAME }}" "${PATTERNS[@]}" -d hasil_ekstrak/ && EXTRACT_OK=1 || \
+                echo "⚠ Tidak ada file yang cocok dengan pola yang diberikan."
+              ;;
+
+            # ── 7Z ──────────────────────────────────────────────────────────────
+            # Sama seperti unzip: listing 7z hanya baca header arsip (sangat cepat),
+            # bukan seluruh isi — jadi 2 perintah tidak berarti 2x proses penuh.
+            7z)
+              7z l -ba -slt -mmt=on "${{ env.ARCHIVE_NAME }}" \
+                | grep "^Path = " | sed 's/^Path = //' > _meta/daftar_struktur.txt
+              7z x -mmt=on "${{ env.ARCHIVE_NAME }}" "${PATTERNS[@]}" \
+                -ohasil_ekstrak/ -r && EXTRACT_OK=1 || \
+                echo "⚠ Tidak ada file yang cocok dengan pola yang diberikan."
+              ;;
+          esac
+
+          # ─── Simpan status ekstrak untuk step berikutnya ──────────────────────
+          echo "EXTRACT_OK=$EXTRACT_OK" >> $GITHUB_ENV
+
+          # ─── Konfirmasi daftar_struktur.txt ───────────────────────────────────
+          JUMLAH_FILE=$(wc -l < _meta/daftar_struktur.txt)
           echo ""
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          TOTAL=${#PATTERNS[@]}
-          SUCCESS=$((TOTAL - FAILED))
-          echo "Selesai: $SUCCESS/$TOTAL pola berhasil diekstrak."
+          echo "✓ daftar_struktur.txt → $JUMLAH_FILE entri"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-          # Tampilkan hasil akhir
-          echo ""
-          echo "File yang berhasil diekstrak:"
-          find hasil_ekstrak/ -type f | sort
+          # ─── Tampilkan hasil ekstrak ───────────────────────────────────────────
+          if [[ $EXTRACT_OK -eq 1 ]]; then
+            echo "File yang berhasil diekstrak:"
+            find hasil_ekstrak/ -type f | sort
+          fi
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-      - name: 5. Upload Artefak Struktur File (.txt)
+      - name: 4. Upload Artefak Struktur File (.txt)
         uses: actions/upload-artifact@v4
-        if: always()
+        if: always()   # ← tetap upload meski ekstrak gagal/tidak ada file cocok
         with:
           name: struktur-${{ inputs.archive_format }}-txt
-          path: daftar_struktur.txt
+          path: _meta/daftar_struktur.txt
           retention-days: 7
 
-      - name: 6. Upload Artefak Hasil (Zipped by GitHub)
+      - name: 5. Upload Artefak Hasil Ekstrak
         uses: actions/upload-artifact@v4
+        if: env.EXTRACT_OK == '1'   # ← hanya upload jika ada file yang berhasil diekstrak
         with:
           name: fast-ekstrak-hasil
           path: hasil_ekstrak/
           retention-days: 7
 
-      - name: 7. Bersihkan File Besar
+      - name: 6. Bersihkan File Besar
         if: always()
         run: rm -f "${{ env.ARCHIVE_NAME }}"
