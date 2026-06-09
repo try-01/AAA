@@ -55,18 +55,34 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── [BARU] Cache apt agar instalasi tool lebih cepat di run berikutnya ──
+      # ── Cache tool ke folder user (~/.apt-cache) agar tidak butuh sudo saat tar ──
       - name: 0. Cache Paket APT
+        id: apt-cache
         uses: actions/cache@v4
         with:
-          path: /var/cache/apt/archives
-          key: apt-${{ runner.os }}-extractor-v1
-          restore-keys: apt-${{ runner.os }}-
+          path: ~/.apt-cache
+          key: apt-${{ runner.os }}-extractor-v2-${{ hashFiles('.github/workflows/*.yml') }}
+          restore-keys: apt-${{ runner.os }}-extractor-v2-
 
       - name: 1. Pasang Alat Pendongkrak Kecepatan
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq unzip p7zip-full aria2 pigz pv
+          # Jika cache hit: salin .deb dari ~/.apt-cache ke /var/cache/apt/archives lalu install
+          # Jika cache miss: download, install, lalu salin .deb ke ~/.apt-cache untuk disimpan
+          TOOLS="unzip p7zip-full aria2 pigz pv"
+          mkdir -p ~/.apt-cache
+
+          if [[ "${{ steps.apt-cache.outputs.cache-hit }}" == "true" ]]; then
+            echo "Cache hit — menyalin paket dari cache..."
+            sudo cp -n ~/.apt-cache/*.deb /var/cache/apt/archives/ 2>/dev/null || true
+            sudo apt-get install -y -qq --no-download $TOOLS 2>/dev/null ||               { echo "Fallback: download ulang paket yang hilang..."; sudo apt-get install -y -qq $TOOLS; }
+          else
+            echo "Cache miss — mengunduh dan menginstal paket..."
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq $TOOLS
+            # Salin .deb yang baru diunduh ke folder user untuk di-cache
+            cp /var/cache/apt/archives/*.deb ~/.apt-cache/ 2>/dev/null || true
+            echo "$(ls ~/.apt-cache/*.deb 2>/dev/null | wc -l) paket disimpan ke cache."
+          fi
 
       - name: 2. Unduh Paralel dengan Aria2c
         run: |
