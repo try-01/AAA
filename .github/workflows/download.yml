@@ -27,7 +27,13 @@ on:
         options:
           - tar    # Gunakan untuk .tar, .tgz, .tar.gz (Didukung pigz)
           - unzip  # Gunakan untuk .zip murni
-          - 7z     # Gunakan untuk .7z, .rar, atau multi-format
+          - 7z     # Gunakan untuk .7z, .zip, .rar, atau multi-format
+          - rar    # Gunakan khusus untuk .rar (unrar native)
+      archive_password:
+        description: '[Opsional] Password arsip (untuk .zip/.7z/.rar yang dienkripsi)'
+        required: false
+        type: string
+        default: ''
       retention_days:
         description: 'Lama simpan artefak (hari)'
         required: true
@@ -68,7 +74,7 @@ jobs:
         run: |
           # Jika cache hit: salin .deb dari ~/.apt-cache ke /var/cache/apt/archives lalu install
           # Jika cache miss: download, install, lalu salin .deb ke ~/.apt-cache untuk disimpan
-          TOOLS="unzip p7zip-full aria2 pigz pv"
+          TOOLS="unzip p7zip-full aria2 pigz pv unrar"
           mkdir -p ~/.apt-cache
 
           if [[ "${{ steps.apt-cache.outputs.cache-hit }}" == "true" ]]; then
@@ -143,32 +149,32 @@ jobs:
           # ── [BARU] Catat waktu mulai untuk laporan durasi ──
           TIME_START=$SECONDS
 
+          # ── Siapkan password untuk masing-masing tool ────────────────────
+          PASSWORD="${{ inputs.archive_password }}"
+          HAS_PASS=0
+          [[ -n "$PASSWORD" ]] && HAS_PASS=1 && echo "🔐 Mode password aktif."
+
           case "${{ inputs.unpack_tool }}" in
 
+            # ── TAR: tidak mendukung enkripsi native ─────────────────────────
             tar)
-              TAR_ARGS=()
-              for PATTERN in "${PATTERNS[@]}"; do
-                TAR_ARGS+=(--wildcards --no-anchored "$PATTERN")
-              done
+              [[ $HAS_PASS -eq 1 ]] && echo "⚠ tar tidak mendukung password, parameter diabaikan."
 
               if [[ "${{ inputs.archive_format }}" == "tgz" || "${{ inputs.archive_format }}" == "tar.gz" ]]; then
                 mkfifo /tmp/tar_stream
                 pigz -dc "$ARCHIVE_NAME" > /tmp/tar_stream &
                 PIGZ_PID=$!
-
                 tar -tf /tmp/tar_stream > _meta/daftar_struktur.txt &
                 TAR_LIST_PID=$!
-
                 wait $TAR_LIST_PID
                 wait $PIGZ_PID
 
                 for p in "${PATTERNS[@]}"; do
-                  grep -E "$(echo "$p" | sed 's/\./\\./g; s/\*/.*/g; s/\?/./g')$" \
+                  grep -E "$(echo "$p" | sed 's/\.//g; s/\*/.*/g; s/\?/./g')$" \
                     _meta/daftar_struktur.txt
                 done 2>/dev/null | sort -u > /tmp/files_to_extract.txt || true
 
                 if [[ -s /tmp/files_to_extract.txt ]]; then
-                  # ── [BARU] pv menampilkan progress bar dekompresi ──
                   FILE_SIZE=$(stat -c%s "$ARCHIVE_NAME")
                   pv -s "$FILE_SIZE" "$ARCHIVE_NAME" | pigz -dc | \
                     tar -xf - -C hasil_ekstrak/ --files-from=/tmp/files_to_extract.txt
@@ -182,7 +188,7 @@ jobs:
                 tar -tf "$ARCHIVE_NAME" > _meta/daftar_struktur.txt
 
                 for p in "${PATTERNS[@]}"; do
-                  grep -E "$(echo "$p" | sed 's/\./\\./g; s/\*/.*/g; s/\?/./g')$" \
+                  grep -E "$(echo "$p" | sed 's/\.//g; s/\*/.*/g; s/\?/./g')$" \
                     _meta/daftar_struktur.txt
                 done 2>/dev/null | sort -u > /tmp/files_to_extract.txt || true
 
@@ -196,18 +202,50 @@ jobs:
               fi
               ;;
 
+            # ── UNZIP: -P untuk password ──────────────────────────────────────
             unzip)
               unzip -Z1 "$ARCHIVE_NAME" > _meta/daftar_struktur.txt
-              unzip -q "$ARCHIVE_NAME" "${PATTERNS[@]}" -d hasil_ekstrak/ && EXTRACT_OK=1 || \
-                echo "⚠ Tidak ada file yang cocok dengan pola yang diberikan."
+              if [[ $HAS_PASS -eq 1 ]]; then
+                unzip -q -P "$PASSWORD" "$ARCHIVE_NAME" "${PATTERNS[@]}" -d hasil_ekstrak/ \
+                  && EXTRACT_OK=1 || echo "⚠ Tidak ada file cocok atau password salah."
+              else
+                unzip -q "$ARCHIVE_NAME" "${PATTERNS[@]}" -d hasil_ekstrak/ \
+                  && EXTRACT_OK=1 || echo "⚠ Tidak ada file yang cocok dengan pola yang diberikan."
+              fi
               ;;
 
+            # ── 7Z: -p untuk password, support .zip/.7z/.rar ─────────────────
             7z)
-              7z l -ba -slt -mmt=on "$ARCHIVE_NAME" \
-                | grep "^Path = " | sed 's/^Path = //' > _meta/daftar_struktur.txt
-              7z x -mmt=on "$ARCHIVE_NAME" "${PATTERNS[@]}" \
-                -ohasil_ekstrak/ -r && EXTRACT_OK=1 || \
-                echo "⚠ Tidak ada file yang cocok dengan pola yang diberikan."
+              if [[ $HAS_PASS -eq 1 ]]; then
+                7z l -ba -slt -mmt=on -p"$PASSWORD" "$ARCHIVE_NAME" \
+                  | grep "^Path = " | sed 's/^Path = //' > _meta/daftar_struktur.txt 2>/dev/null || \
+                  echo "⚠ Listing gagal — password salah atau header terenkripsi."
+                7z x -mmt=on -p"$PASSWORD" "$ARCHIVE_NAME" "${PATTERNS[@]}" \
+                  -ohasil_ekstrak/ -r && EXTRACT_OK=1 || \
+                  echo "⚠ Tidak ada file cocok atau password salah."
+              else
+                7z l -ba -slt -mmt=on "$ARCHIVE_NAME" \
+                  | grep "^Path = " | sed 's/^Path = //' > _meta/daftar_struktur.txt
+                7z x -mmt=on "$ARCHIVE_NAME" "${PATTERNS[@]}" \
+                  -ohasil_ekstrak/ -r && EXTRACT_OK=1 || \
+                  echo "⚠ Tidak ada file yang cocok dengan pola yang diberikan."
+              fi
+              ;;
+
+            # ── RAR: unrar native, lebih andal untuk .rar v4/v5 ─────────────
+            # unrar lb = list bare (nama file tanpa header)
+            # unrar x  = ekstrak dengan path lengkap
+            rar)
+              if [[ $HAS_PASS -eq 1 ]]; then
+                unrar lb -p"$PASSWORD" "$ARCHIVE_NAME" > _meta/daftar_struktur.txt 2>/dev/null || \
+                  echo "⚠ Listing gagal — password salah."
+                unrar x -p"$PASSWORD" -y "$ARCHIVE_NAME" "${PATTERNS[@]}" hasil_ekstrak/ \
+                  && EXTRACT_OK=1 || echo "⚠ Tidak ada file cocok atau password salah."
+              else
+                unrar lb "$ARCHIVE_NAME" > _meta/daftar_struktur.txt
+                unrar x -y "$ARCHIVE_NAME" "${PATTERNS[@]}" hasil_ekstrak/ \
+                  && EXTRACT_OK=1 || echo "⚠ Tidak ada file yang cocok dengan pola yang diberikan."
+              fi
               ;;
           esac
 
@@ -259,6 +297,7 @@ jobs:
             echo "| Format | \`${{ inputs.archive_format }}\` |"
             echo "| Tool | \`${{ inputs.unpack_tool }}\` |"
             echo "| Pola | \`${{ inputs.search_patterns }}\` |"
+            echo "| Password | $( [[ -n '${{ inputs.archive_password }}' ]] && echo '🔐 Terisi' || echo '— Tidak ada' ) |"
             echo "| Ukuran arsip | $(du -sh "$ARCHIVE_NAME" 2>/dev/null | cut -f1 || echo 'sudah dihapus') |"
             echo "| Retensi artefak | ${{ inputs.retention_days }} hari |"
             echo ""
