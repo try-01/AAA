@@ -28,6 +28,24 @@ on:
           - tar    # Gunakan untuk .tar, .tgz, .tar.gz (Didukung pigz)
           - unzip  # Gunakan untuk .zip murni
           - 7z     # Gunakan untuk .7z, .rar, atau multi-format
+      retention_days:
+        description: 'Lama simpan artefak (hari)'
+        required: true
+        type: choice
+        options:
+          - '3'
+          - '7'
+          - '14'
+          - '30'
+        default: '7'
+      checksum_url:
+        description: '[Opsional] URL file checksum MD5/SHA256 untuk validasi arsip'
+        required: false
+        type: string
+        default: ''
+
+env:
+  ARCHIVE_NAME: downloaded_archive.${{ inputs.archive_format }}
 
 jobs:
   fast-extract-upload:
@@ -37,19 +55,57 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ── [BARU] Cache apt agar instalasi tool lebih cepat di run berikutnya ──
+      - name: 0. Cache Paket APT
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-${{ runner.os }}-extractor-v1
+          restore-keys: apt-${{ runner.os }}-
+
       - name: 1. Pasang Alat Pendongkrak Kecepatan
         run: |
-          echo "Menginstal aria2c (Parallel Downloader) dan pigz (Parallel GZIP)..."
           sudo apt-get update -qq
-          sudo apt-get install -y -qq unzip p7zip-full aria2 pigz
+          sudo apt-get install -y -qq unzip p7zip-full aria2 pigz pv
 
       - name: 2. Unduh Paralel dengan Aria2c
         run: |
-          ARCHIVE_NAME="downloaded_archive.${{ inputs.archive_format }}"
           echo "Mengunduh file besar secara paralel (16 koneksi)..."
-          aria2c --max-connection-per-server=16 --split=16 --min-split-size=1M \
-                 --continue=true --out="$ARCHIVE_NAME" "${{ inputs.file_url }}"
-          echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> $GITHUB_ENV
+          aria2c \
+            --max-connection-per-server=16 \
+            --split=16 \
+            --min-split-size=1M \
+            --continue=true \
+            --retry-wait=5 \
+            --max-tries=5 \
+            --out="$ARCHIVE_NAME" \
+            "${{ inputs.file_url }}"
+
+          # ── [BARU] Tampilkan ukuran file yang diunduh ──
+          echo ""
+          echo "Ukuran file: $(du -sh "$ARCHIVE_NAME" | cut -f1)"
+
+      # ── [BARU] Validasi checksum jika URL checksum disediakan ────────────────
+      - name: 2b. Validasi Checksum (Opsional)
+        if: inputs.checksum_url != ''
+        run: |
+          echo "Mengunduh file checksum..."
+          curl -sL "${{ inputs.checksum_url }}" -o _checksum.txt
+          cat _checksum.txt
+
+          # Deteksi otomatis MD5 atau SHA256 dari panjang hash
+          HASH=$(awk '{print $1}' _checksum.txt | head -1)
+          HASH_LEN=${#HASH}
+
+          if [[ $HASH_LEN -eq 32 ]]; then
+            echo "Menggunakan MD5..."
+            echo "$HASH  $ARCHIVE_NAME" | md5sum -c -
+          elif [[ $HASH_LEN -eq 64 ]]; then
+            echo "Menggunakan SHA256..."
+            echo "$HASH  $ARCHIVE_NAME" | sha256sum -c -
+          else
+            echo "⚠ Format checksum tidak dikenali, lewati validasi."
+          fi
 
       - name: 3. Listing + Ekstrak Sekaligus (Arsip Hanya Dibuka 1x)
         run: |
@@ -67,51 +123,38 @@ jobs:
           for p in "${PATTERNS[@]}"; do echo "  → $p"; done
           echo ""
 
-          # ─── Proses per tool ──────────────────────────────────────────────────
           EXTRACT_OK=0
+          # ── [BARU] Catat waktu mulai untuk laporan durasi ──
+          TIME_START=$SECONDS
 
           case "${{ inputs.unpack_tool }}" in
 
-            # ── TAR ─────────────────────────────────────────────────────────────
-            # Gunakan satu perintah tar dengan --to-command untuk menghasilkan
-            # listing dan ekstrak sekaligus dalam 1x baca stream arsip.
-            # Caranya: jalankan tar -tf (listing) sambil pipe ke tee, lalu
-            # langsung jalankan tar -xf dengan semua pola sekaligus.
-            # Karena tar adalah stream, listing (-tf) dan ekstrak (-xf) tidak
-            # bisa benar-benar 1 pass — tapi kita minimalisir dengan menjalankan
-            # keduanya dalam subshell paralel yang membaca arsip bersamaan.
             tar)
-              # Bangun argumen wildcard untuk ekstrak
               TAR_ARGS=()
               for PATTERN in "${PATTERNS[@]}"; do
                 TAR_ARGS+=(--wildcards --no-anchored "$PATTERN")
               done
 
               if [[ "${{ inputs.archive_format }}" == "tgz" || "${{ inputs.archive_format }}" == "tar.gz" ]]; then
-                # Dekompresi arsip 1x ke named pipe, lalu listing & ekstrak baca bersamaan
                 mkfifo /tmp/tar_stream
-                pigz -dc "${{ env.ARCHIVE_NAME }}" > /tmp/tar_stream &
+                pigz -dc "$ARCHIVE_NAME" > /tmp/tar_stream &
                 PIGZ_PID=$!
 
-                # Baca stream yang sama untuk listing dan ekstrak secara paralel
                 tar -tf /tmp/tar_stream > _meta/daftar_struktur.txt &
                 TAR_LIST_PID=$!
 
-                # Tunggu listing selesai, lalu ekstrak (stream sudah selesai dibaca)
                 wait $TAR_LIST_PID
                 wait $PIGZ_PID
 
-                # Ekstrak dengan file listing sebagai filter (arsip dibaca sekali lagi
-                # tapi dekompresi hanya 1x karena listing sudah tersedia)
-                # Strategi: gunakan listing untuk --files-from agar ekstrak tepat sasaran
-                grep -F -f <(for p in "${PATTERNS[@]}"; do
+                for p in "${PATTERNS[@]}"; do
                   grep -E "$(echo "$p" | sed 's/\./\\./g; s/\*/.*/g; s/\?/./g')$" \
                     _meta/daftar_struktur.txt
-                done 2>/dev/null | sort -u) _meta/daftar_struktur.txt \
-                  > /tmp/files_to_extract.txt 2>/dev/null || true
+                done 2>/dev/null | sort -u > /tmp/files_to_extract.txt || true
 
                 if [[ -s /tmp/files_to_extract.txt ]]; then
-                  pigz -dc "${{ env.ARCHIVE_NAME }}" | \
+                  # ── [BARU] pv menampilkan progress bar dekompresi ──
+                  FILE_SIZE=$(stat -c%s "$ARCHIVE_NAME")
+                  pv -s "$FILE_SIZE" "$ARCHIVE_NAME" | pigz -dc | \
                     tar -xf - -C hasil_ekstrak/ --files-from=/tmp/files_to_extract.txt
                   EXTRACT_OK=1
                 else
@@ -120,17 +163,15 @@ jobs:
                 rm -f /tmp/tar_stream
 
               else
-                # tar biasa (non-gzip): listing dulu, lalu ekstrak dengan --files-from
-                tar -tf "${{ env.ARCHIVE_NAME }}" > _meta/daftar_struktur.txt
+                tar -tf "$ARCHIVE_NAME" > _meta/daftar_struktur.txt
 
-                grep -F -f <(for p in "${PATTERNS[@]}"; do
+                for p in "${PATTERNS[@]}"; do
                   grep -E "$(echo "$p" | sed 's/\./\\./g; s/\*/.*/g; s/\?/./g')$" \
                     _meta/daftar_struktur.txt
-                done 2>/dev/null | sort -u) _meta/daftar_struktur.txt \
-                  > /tmp/files_to_extract.txt 2>/dev/null || true
+                done 2>/dev/null | sort -u > /tmp/files_to_extract.txt || true
 
                 if [[ -s /tmp/files_to_extract.txt ]]; then
-                  tar -xf "${{ env.ARCHIVE_NAME }}" -C hasil_ekstrak/ \
+                  tar -xf "$ARCHIVE_NAME" -C hasil_ekstrak/ \
                     --files-from=/tmp/files_to_extract.txt
                   EXTRACT_OK=1
                 else
@@ -139,61 +180,142 @@ jobs:
               fi
               ;;
 
-            # ── UNZIP ───────────────────────────────────────────────────────────
-            # unzip -Z1 (listing) sangat cepat karena hanya baca central directory
-            # di akhir file ZIP — tidak membaca seluruh isi arsip.
-            # Jadi listing + ekstrak tetap efisien meski 2 perintah terpisah.
             unzip)
-              unzip -Z1 "${{ env.ARCHIVE_NAME }}" > _meta/daftar_struktur.txt
-              unzip -q "${{ env.ARCHIVE_NAME }}" "${PATTERNS[@]}" -d hasil_ekstrak/ && EXTRACT_OK=1 || \
+              unzip -Z1 "$ARCHIVE_NAME" > _meta/daftar_struktur.txt
+              unzip -q "$ARCHIVE_NAME" "${PATTERNS[@]}" -d hasil_ekstrak/ && EXTRACT_OK=1 || \
                 echo "⚠ Tidak ada file yang cocok dengan pola yang diberikan."
               ;;
 
-            # ── 7Z ──────────────────────────────────────────────────────────────
-            # Sama seperti unzip: listing 7z hanya baca header arsip (sangat cepat),
-            # bukan seluruh isi — jadi 2 perintah tidak berarti 2x proses penuh.
             7z)
-              7z l -ba -slt -mmt=on "${{ env.ARCHIVE_NAME }}" \
+              7z l -ba -slt -mmt=on "$ARCHIVE_NAME" \
                 | grep "^Path = " | sed 's/^Path = //' > _meta/daftar_struktur.txt
-              7z x -mmt=on "${{ env.ARCHIVE_NAME }}" "${PATTERNS[@]}" \
+              7z x -mmt=on "$ARCHIVE_NAME" "${PATTERNS[@]}" \
                 -ohasil_ekstrak/ -r && EXTRACT_OK=1 || \
                 echo "⚠ Tidak ada file yang cocok dengan pola yang diberikan."
               ;;
           esac
 
-          # ─── Simpan status ekstrak untuk step berikutnya ──────────────────────
           echo "EXTRACT_OK=$EXTRACT_OK" >> $GITHUB_ENV
 
-          # ─── Konfirmasi daftar_struktur.txt ───────────────────────────────────
-          JUMLAH_FILE=$(wc -l < _meta/daftar_struktur.txt)
+          # ── [BARU] Laporan ringkas: durasi, ukuran hasil, jumlah file ──────────
+          TIME_END=$SECONDS
+          DURATION=$((TIME_END - TIME_START))
           echo ""
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "✓ daftar_struktur.txt → $JUMLAH_FILE entri"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-          # ─── Tampilkan hasil ekstrak ───────────────────────────────────────────
+          echo "✓ daftar_struktur.txt → $(wc -l < _meta/daftar_struktur.txt) entri"
           if [[ $EXTRACT_OK -eq 1 ]]; then
-            echo "File yang berhasil diekstrak:"
+            JUMLAH=$(find hasil_ekstrak/ -type f | wc -l)
+            UKURAN=$(du -sh hasil_ekstrak/ | cut -f1)
+            echo "✓ File diekstrak  → $JUMLAH file ($UKURAN)"
+            echo ""
+            echo "Daftar file hasil ekstrak:"
             find hasil_ekstrak/ -type f | sort
           fi
+          echo "⏱ Durasi step ini → ${DURATION}s"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
       - name: 4. Upload Artefak Struktur File (.txt)
         uses: actions/upload-artifact@v4
-        if: always()   # ← tetap upload meski ekstrak gagal/tidak ada file cocok
+        if: always()
         with:
           name: struktur-${{ inputs.archive_format }}-txt
           path: _meta/daftar_struktur.txt
-          retention-days: 7
+          retention-days: ${{ inputs.retention_days }}
 
       - name: 5. Upload Artefak Hasil Ekstrak
         uses: actions/upload-artifact@v4
-        if: env.EXTRACT_OK == '1'   # ← hanya upload jika ada file yang berhasil diekstrak
+        if: env.EXTRACT_OK == '1'
         with:
           name: fast-ekstrak-hasil
           path: hasil_ekstrak/
-          retention-days: 7
+          retention-days: ${{ inputs.retention_days }}
 
-      - name: 6. Bersihkan File Besar
+      # ── [BARU] Ringkasan akhir tampil di tab Summary GitHub Actions ───────────
+      - name: 6. Tulis Ringkasan ke Job Summary
         if: always()
-        run: rm -f "${{ env.ARCHIVE_NAME }}"
+        run: |
+          {
+            echo "## 📦 Hasil Ekstrak"
+            echo ""
+            echo "| Parameter | Nilai |"
+            echo "|-----------|-------|"
+            echo "| File URL | \`${{ inputs.file_url }}\` |"
+            echo "| Format | \`${{ inputs.archive_format }}\` |"
+            echo "| Tool | \`${{ inputs.unpack_tool }}\` |"
+            echo "| Pola | \`${{ inputs.search_patterns }}\` |"
+            echo "| Ukuran arsip | $(du -sh "$ARCHIVE_NAME" 2>/dev/null | cut -f1 || echo 'sudah dihapus') |"
+            echo "| Retensi artefak | ${{ inputs.retention_days }} hari |"
+            echo ""
+            if [[ "$EXTRACT_OK" == "1" ]]; then
+              JUMLAH=$(find hasil_ekstrak/ -type f 2>/dev/null | wc -l)
+              UKURAN=$(du -sh hasil_ekstrak/ 2>/dev/null | cut -f1 || echo '-')
+              echo "### ✅ Ekstrak Berhasil"
+              echo "- **$JUMLAH file** diekstrak (total **$UKURAN**)"
+              echo ""
+              echo "#### File yang diekstrak:"
+              echo '```'
+              find hasil_ekstrak/ -type f | sort
+              echo '```'
+            else
+              echo "### ⚠️ Tidak Ada File Cocok"
+              echo "Tidak ada file dalam arsip yang cocok dengan pola: \`${{ inputs.search_patterns }}\`"
+              echo ""
+              echo "> Gunakan artefak **daftar_struktur.txt** untuk melihat isi arsip dan sesuaikan pola."
+            fi
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: 7. Bersihkan Semua File Kerja
+        if: always()
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🧹 Memulai pembersihan workspace..."
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          # Catat ruang disk sebelum dihapus
+          SPACE_BEFORE=$(df -h . | awk 'NR==2{print $4}')
+
+          # ── Arsip yang diunduh ──────────────────────────────────────────────
+          if [[ -f "$ARCHIVE_NAME" ]]; then
+            SIZE=$(du -sh "$ARCHIVE_NAME" | cut -f1)
+            rm -f "$ARCHIVE_NAME"
+            echo "✓ Arsip unduhan dihapus         ($SIZE) → $ARCHIVE_NAME"
+          else
+            echo "– Arsip unduhan tidak ada (sudah terhapus sebelumnya)"
+          fi
+
+          # ── Hasil ekstrak ───────────────────────────────────────────────────
+          if [[ -d hasil_ekstrak ]]; then
+            SIZE=$(du -sh hasil_ekstrak/ | cut -f1)
+            JUMLAH=$(find hasil_ekstrak/ -type f | wc -l)
+            rm -rf hasil_ekstrak/
+            echo "✓ Hasil ekstrak dihapus         ($SIZE, $JUMLAH file) → hasil_ekstrak/"
+          else
+            echo "– hasil_ekstrak/ tidak ada"
+          fi
+
+          # ── Folder _meta (daftar_struktur.txt, dll) ─────────────────────────
+          if [[ -d _meta ]]; then
+            SIZE=$(du -sh _meta/ | cut -f1)
+            rm -rf _meta/
+            echo "✓ Folder _meta dihapus          ($SIZE) → _meta/"
+          else
+            echo "– _meta/ tidak ada"
+          fi
+
+          # ── File temporer di /tmp ────────────────────────────────────────────
+          for f in /tmp/tar_stream /tmp/files_to_extract.txt /tmp/_checksum.txt; do
+            if [[ -e "$f" ]]; then
+              rm -f "$f"
+              echo "✓ File temp dihapus             → $f"
+            fi
+          done
+
+          # ── Laporan ruang disk yang dibebaskan ───────────────────────────────
+          SPACE_AFTER=$(df -h . | awk 'NR==2{print $4}')
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📊 Ruang disk tersedia:"
+          echo "   Sebelum cleanup : $SPACE_BEFORE"
+          echo "   Setelah cleanup : $SPACE_AFTER"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "✅ Workspace bersih."
